@@ -58,6 +58,16 @@ static pthread_once_t vkd3d_dbg_once = PTHREAD_ONCE_INIT;
 static FILE *vkd3d_log_file;
 static bool vkd3d_disable_file;
 
+#if defined(_WIN32) && defined(VKD3D_BUILD_UMD)
+/* A driver must not consume the application's stderr pipe. Some adapter
+ * probes drain stdout only, so a few KiB of startup diagnostics deadlock
+ * device creation. Keep explicit file logging, otherwise use the debugger. */
+static bool vkd3d_dbg_use_debugger(void)
+{
+    return !vkd3d_log_file;
+}
+#endif
+
 void vkd3d_dbg_disable_debug_file(void)
 {
     vkd3d_disable_file = true;
@@ -97,6 +107,7 @@ static void vkd3d_dbg_init_once(void)
             vkd3d_dbg_level[channel] = VKD3D_DBG_LEVEL_FIXME;
     }
 
+#if !defined(_WIN32) || !defined(VKD3D_BUILD_UMD)
     if (vkd3d_get_env_var("VKD3D_LOG_BUFFERED", vkd3d_debug, sizeof(vkd3d_debug)))
     {
         vkd3d_dbg_buffer.offset = 0;
@@ -106,6 +117,7 @@ static void vkd3d_dbg_init_once(void)
         fprintf(stderr, "Using VKD3D_LOG_BUFFERED with %zu byte chunks.\n", vkd3d_dbg_buffer.size);
         vkd3d_dbg_buffer.buffer = malloc(vkd3d_dbg_buffer.size);
     }
+#endif
 
     if (!vkd3d_disable_file && vkd3d_get_env_var("VKD3D_LOG_FILE", vkd3d_debug, sizeof(vkd3d_debug)))
     {
@@ -113,8 +125,12 @@ static void vkd3d_dbg_init_once(void)
         vkd3d_log_file = fopen(vkd3d_debug, vkd3d_dbg_buffer.buffer ? "wb" : "w");
         if (!vkd3d_log_file)
         {
+#if defined(_WIN32) && defined(VKD3D_BUILD_UMD)
+            OutputDebugStringA("vkd3d-proton: Failed to open VKD3D_LOG_FILE; using debugger output.\n");
+#else
             fprintf(stderr, "Failed to open log file: %s!\n", vkd3d_debug);
             fflush(stderr);
+#endif
         }
     }
     else
@@ -186,6 +202,20 @@ void vkd3d_dbg_printf(enum vkd3d_dbg_channel channel, enum vkd3d_dbg_level level
 
     va_start(args, fmt);
     tid = vkd3d_get_current_thread_id();
+
+#if defined(_WIN32) && defined(VKD3D_BUILD_UMD)
+    if (vkd3d_dbg_use_debugger())
+    {
+        char message[4096];
+        int offset = snprintf(message, sizeof(message), "%04x:%s:%s: ",
+                tid, debug_level_names[level], function);
+        if (offset >= 0 && (size_t)offset < sizeof(message))
+            vsnprintf(message + offset, sizeof(message) - offset, fmt, args);
+        OutputDebugStringA(message);
+        va_end(args);
+        return;
+    }
+#endif
 
     if (vkd3d_dbg_buffer.buffer)
     {
